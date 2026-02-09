@@ -42,6 +42,7 @@ void deserialize_and_distribute(const raft::resources& clique,
                                 mg_index<AnnIndexType, T, IdxT>& index,
                                 const std::string& filename)
 {
+  index.ann_interfaces_.reserve(index.num_ranks_);
   for (int rank = 0; rank < index.num_ranks_; rank++) {
     const raft::resources& dev_res = raft::resource::set_current_device_to_rank(clique, rank);
     auto& ann_if                   = index.ann_interfaces_.emplace_back();
@@ -72,6 +73,7 @@ void deserialize(const raft::resources& clique,
               raft::resource::get_num_ranks(clique));
   }
 
+  index.ann_interfaces_.reserve(index.num_ranks_);
   for (int rank = 0; rank < index.num_ranks_; rank++) {
     const raft::resources& dev_res = raft::resource::set_current_device_to_rank(clique, rank);
     auto& ann_if                   = index.ann_interfaces_.emplace_back();
