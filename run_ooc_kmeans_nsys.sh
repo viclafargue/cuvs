@@ -28,7 +28,7 @@ mkdir -p "$OUTPUT_DIR"
 run_case() {
   local memory=$1
   local prefetch=$2
-  local buffering output range prefetch_arg
+  local buffering output prefetch_arg
 
   if [[ $prefetch == 1 ]]; then
     buffering=prefetch
@@ -39,7 +39,6 @@ run_case() {
   fi
 
   output="$OUTPUT_DIR/ooc_${memory}_${buffering}"
-  range="ooc_kmeans/${memory}/prefetch_${prefetch}"
 
   echo
   echo "Profiling memory=$memory buffering=$buffering"
@@ -47,8 +46,7 @@ run_case() {
 
   "$NSYS_BIN" profile \
     --trace=cuda,nvtx,osrt \
-    --capture-range=nvtx \
-    --nvtx-capture="$range" \
+    --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     --force-overwrite=true \
     -o "$output" \
@@ -61,6 +59,11 @@ run_case() {
       --clusters "$CLUSTERS" \
       --max-iter "$MAX_ITER" \
       --compute-batch-rows "$COMPUTE_BATCH_ROWS"
+
+  if [[ ! -s "${output}.nsys-rep" && ! -s "${output}.qdrep" ]]; then
+    echo "ERROR: Nsight Systems did not generate a report for $memory/$buffering" >&2
+    return 1
+  fi
 }
 
 run_case pageable 0

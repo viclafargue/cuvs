@@ -179,6 +179,7 @@ def main() -> None:
 
     range_name = f"ooc_kmeans/{args.memory}/prefetch_{int(args.prefetch)}"
     print(f"NVTX capture range: {range_name}", flush=True)
+    cp.cuda.runtime.profilerStart()
     cp.cuda.nvtx.RangePush(range_name)
     start = time.perf_counter()
     try:
@@ -186,7 +187,10 @@ def main() -> None:
         cp.cuda.Device().synchronize()
     finally:
         elapsed = time.perf_counter() - start
-        cp.cuda.nvtx.RangePop()
+        try:
+            cp.cuda.nvtx.RangePop()
+        finally:
+            cp.cuda.runtime.profilerStop()
 
     # Keep both allocations alive through the end of the captured fit.
     _ = pinned_owner, centroids
