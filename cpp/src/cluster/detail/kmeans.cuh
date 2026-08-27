@@ -869,6 +869,8 @@ void kmeans_fit(
         wt_it = weight_batches->begin();
         wt_it->prefetch_next_batch();
       }
+      data_batches.prefetch_next_batch();
+      if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
       for (const auto& data_batch : data_batches) {
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;
@@ -917,6 +919,8 @@ void kmeans_fit(
                                      weight_per_cluster.view(),
                                      clustering_cost.view(),
                                      batch_workspace);
+        data_batches.prefetch_next_batch();
+        if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
         data_batches.prefetch_next_batch();
         if (wt_it.has_value()) {
           wt_it->prefetch_next_batch();
@@ -973,6 +977,8 @@ void kmeans_fit(
         wt_it = weight_batches->begin();
         wt_it->prefetch_next_batch();
       }
+      data_batches.prefetch_next_batch();
+      if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
       for (const auto& data_batch : data_batches) {
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;

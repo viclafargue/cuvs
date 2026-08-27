@@ -18,6 +18,7 @@
 #include <raft/util/cudart_utils.hpp>
 #include <raft/util/integer_utils.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
@@ -25,6 +26,7 @@
 
 #include <cuda_fp16.hpp>
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <type_traits>
@@ -32,6 +34,21 @@
 #include <variant>
 
 namespace cuvs::spatial::knn::detail::utils {
+
+/** Temporary, KMeans-specific transfer benchmark switch. */
+inline auto kmeans_ooc_prefetch_enabled() -> bool
+{
+  const char* value = std::getenv("CUVS_KMEANS_OOC_PREFETCH");
+  return value != nullptr && std::atoi(value) != 0;
+}
+
+/** Supply a dedicated H2D stream when the temporary KMeans benchmark switch is enabled. */
+inline auto kmeans_ooc_copy_stream(rmm::cuda_stream_view fallback) -> rmm::cuda_stream_view
+{
+  if (!kmeans_ooc_prefetch_enabled()) { return fallback; }
+  static thread_local rmm::cuda_stream copy_stream;
+  return copy_stream.view();
+}
 
 /** Whether pointers are accessible on the device or on the host. */
 enum class pointer_residency {
@@ -605,7 +622,7 @@ struct batch_load_iterator {
           bool prefetch,
           bool initialize,
           bool host_writeback)
-      : copy_stream_(copy_stream),
+      : copy_stream_(kmeans_ooc_copy_stream(copy_stream)),
         res_(&res),
         input_view_(input_view),
         source_(get_source(input_view)),
@@ -613,11 +630,11 @@ struct batch_load_iterator {
         row_width_(static_cast<size_type>(input_view.extent(1))),
         batch_size_(std::min<size_type>(batch_size, std::max<size_type>(n_rows_, 1))),
         n_iters_(n_rows_ == 0 ? 0 : raft::div_rounding_up_safe(n_rows_, batch_size_)),
-        prefetch_(prefetch),
+        prefetch_(prefetch || kmeans_ooc_prefetch_enabled()),
         initialize_(initialize),
         host_writeback_(host_writeback),
-        buf_0_(0, copy_stream, mr),
-        buf_1_(0, copy_stream, mr)
+        buf_0_(0, copy_stream_, mr),
+        buf_1_(0, copy_stream_, mr)
     {
       if (n_rows_ == 0) { return; }
       RAFT_EXPECTS(initialize_ || host_writeback_,
@@ -631,14 +648,14 @@ struct batch_load_iterator {
           // Skip allocation and never queue copies.
           return;
         }
-        buf_0_.resize(row_width_ * batch_size_, copy_stream);
+        buf_0_.resize(row_width_ * batch_size_, copy_stream_);
         dev_ptr_ = reinterpret_cast<element_type*>(buf_0_.data());
         // The second buffer is only useful when there is more than one batch to overlap. With
         // n_iters_ <= 1, there is no "next batch" to stage while a kernel runs on the current
         // one, so prefetching offers no benefit. Downgrade `prefetch_` to false to skip the
         // buf_1_ allocation and have `prefetch()` / `load()` take the single-buffer fast path.
         if (prefetch_ && n_iters_ > 1) {
-          buf_1_.resize(row_width_ * batch_size_, copy_stream);
+          buf_1_.resize(row_width_ * batch_size_, copy_stream_);
           prefetch_dev_ptr_ = reinterpret_cast<element_type*>(buf_1_.data());
         } else {
           prefetch_ = false;
