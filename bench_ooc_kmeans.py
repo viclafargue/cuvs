@@ -140,6 +140,8 @@ def main() -> None:
     cp.cuda.runtime.getDeviceCount()
     cp.cuda.Device().synchronize()
     free_device, total_device = cp.cuda.Device().mem_info
+    workspace_limit = int(total_device * 0.9)
+    os.environ["CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES"] = str(workspace_limit)
     resident_batches = 2 if args.prefetch else 1
     transfer_buffers = resident_batches * batch_bytes
     if transfer_buffers > int(total_device * 0.9):
@@ -160,7 +162,8 @@ def main() -> None:
         f"GPU={total_device / GIB:.2f} GiB total, "
         f"{free_device / GIB:.2f} GiB free; "
         f"streaming_batch={batch_rows} rows ({batch_bytes / GIB:.2f} GiB); "
-        f"transfer_buffers~={transfer_buffers / GIB:.2f} GiB",
+        f"transfer_buffers~={transfer_buffers / GIB:.2f} GiB; "
+        f"workspace_limit={workspace_limit / GIB:.2f} GiB",
         flush=True,
     )
 

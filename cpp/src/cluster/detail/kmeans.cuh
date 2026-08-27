@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <limits>
 #include <optional>
@@ -596,6 +597,16 @@ void kmeans_fit(
   }
 
   constexpr bool data_on_device = raft::is_device_mdspan_v<decltype(X)>;
+  if constexpr (!data_on_device) {
+    if (const char* value = std::getenv("CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES")) {
+      char* end       = nullptr;
+      auto byte_limit = std::strtoull(value, &end, 10);
+      RAFT_EXPECTS(end != value && *end == '\0' && byte_limit > 0,
+                   "CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES must be a positive integer");
+      raft::resource::set_workspace_to_global_resource(const_cast<raft::resources&>(handle),
+                                                       static_cast<std::size_t>(byte_limit));
+    }
+  }
 
   const DataT* weight_ptr =
     sample_weight.has_value() ? sample_weight.value().data_handle() : nullptr;
