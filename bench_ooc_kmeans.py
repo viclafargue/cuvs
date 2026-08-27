@@ -168,10 +168,10 @@ def main() -> None:
         n_clusters=args.clusters,
         init_method="Random",
         max_iter=args.max_iter,
-        tol=0.0,
+        tol=1.0e-12,
         n_init=1,
         batch_samples=args.compute_batch_rows,
-        streaming_batch_size=batch_rows,
+        device_buffer_samples=batch_rows,
     )
 
     range_name = f"ooc_kmeans/{args.memory}/prefetch_{int(args.prefetch)}"
