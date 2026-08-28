@@ -443,15 +443,19 @@ inline auto get_prefetch_stream(raft::resources const& res)
  *     `get_prefetch_stream(res)`); otherwise no real overlap is possible.
  *   * Writeback is done with a 2-iteration delay so that the D2H of batch `i` is queued in the
  *     `prefetch_next_batch()` of iteration `i+2` -- right before the same slot is overwritten by
- *     the next H2D. This way the D2H reads a slot whose user kernel (`kernel_i`) is two
- *     iterations old and therefore guaranteed finished, without needing CUDA events for
- *     cross-stream synchronization.
- *   * `prefetch_next_batch()` queues, on `copy_stream`, in order: (1) D2H of the prefetch slot's
- *     stale kernel output (if `host_writeback`), then (2) H2D of `pos` into the prefetch slot
- *     (if `initialize`); then it `sync_stream(res)`'s so the host stall for the previous kernel
- *     overlaps with the just-queued copies.
- *   * `operator*` (next iteration's `load()`) swaps the ring slots and `synchronize()`'s
- *     `copy_stream` so the swapped-in slot is fully staged before the user's next kernel runs.
+ *     the next H2D.
+ *   * Ordering between the two streams is enforced with CUDA events, never host stalls, so the
+ *     host is free to run ahead and keep both streams fed:
+ *       - `load()` records the main stream's position (which is "through the previous batch's
+ *         kernel", since the caller has not enqueued this batch's work yet) and makes the main
+ *         stream wait for the staging copies of the slot it swaps in.
+ *       - `prefetch_next_batch()` makes `copy_stream` wait for that recorded position before
+ *         overwriting the retired slot, then queues (1) the stale D2H if `host_writeback`, and
+ *         (2) the H2D of `pos` if `initialize`.
+ *     Because the main-stream event is recorded in `load()`, correctness does not depend on where
+ *     the caller places `prefetch_next_batch()` in the loop body. Calling it *before* enqueueing
+ *     the batch's kernels is preferable: the transfer then reaches the GPU ahead of the kernel
+ *     launches instead of queueing behind them.
  *
  * Stream model (prefetch=false):
  *   * Single buffer; copies happen synchronously inside `operator*` with `copy_stream` then
@@ -463,10 +467,10 @@ inline auto get_prefetch_stream(raft::resources const& res)
  * ```
  * auto [copy_stream, enable_prefetch] = utils::get_prefetch_stream(res);
  * utils::batch_load_iterator iter(res, view, batch_size, copy_stream, mr, enable_prefetch);
- * iter.prefetch_next_batch();
+ * iter.prime();
  * for (auto const& batch : iter) {
+ *   iter.prefetch_next_batch();  // submit before launching, so the copy is not queued behind them
  *   kernel<<<..., raft::resource::get_cuda_stream(res)>>>(batch.data(), ...);
- *   iter.prefetch_next_batch();
  * }
  * ```
  *
@@ -511,18 +515,18 @@ struct batch_load_iterator {
     ~batch() noexcept
     {
       if constexpr (!kPassthrough) {
+        // The user's kernels read the staging buffers on `res`'s main stream and, now that
+        // cross-stream ordering is done with events instead of host stalls, may still be in
+        // flight. Drain the main stream before the `buf_*` members below release the memory
+        // (they deallocate against `copy_stream_`, which knows nothing about those reads) and
+        // before any final writeback D2H reads a slot a kernel is still writing.
+        if (source_ != nullptr) { raft::resource::sync_stream(*res_); }
         if (host_writeback_ && source_ != nullptr) {
           // Two slots may still hold un-flushed kernel output:
           //  * `prefetch_dev_ptr_` for the batch the loop didn't reach (its prefetch_next_batch()
           //    that would have queued the D2H never happened).
           //  * `dev_ptr_` for the most-recently-loaded batch (its writeback is always deferred to
           //    the destructor since no future iteration recycles its slot).
-          // The user kernel that wrote either slot may still be in flight on `res`'s main stream
-          // when this destructor runs, so host-stall on it before issuing the D2Hs to avoid a
-          // read-while-write race.
-          const bool has_pending =
-            (prefetch_ && prefetch_dirty_pos_.has_value()) || (dirty_cur_ && pos_.has_value());
-          if (has_pending) { raft::resource::sync_stream(*res_); }
           if (prefetch_ && prefetch_dirty_pos_.has_value()) {
             queue_d2h(prefetch_dev_ptr_, *prefetch_dirty_pos_);
             prefetch_dirty_pos_.reset();
@@ -536,6 +540,8 @@ struct batch_load_iterator {
       // Stream is shared with the iterator; it must be sync'd before the underlying buffers (or,
       // in the passthrough case, the source mdspan) can be safely reused.
       copy_stream_.synchronize();
+      if (h2d_done_ != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaEventDestroy(h2d_done_)); }
+      if (kernel_done_ != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaEventDestroy(kernel_done_)); }
     }
 
     [[nodiscard]] auto row_width() const -> size_type { return row_width_; }
@@ -640,6 +646,8 @@ struct batch_load_iterator {
         if (prefetch_ && n_iters_ > 1) {
           buf_1_.resize(row_width_ * batch_size_, copy_stream_);
           prefetch_dev_ptr_ = reinterpret_cast<element_type*>(buf_1_.data());
+          RAFT_CUDA_TRY(cudaEventCreateWithFlags(&h2d_done_, cudaEventDisableTiming));
+          RAFT_CUDA_TRY(cudaEventCreateWithFlags(&kernel_done_, cudaEventDisableTiming));
         } else {
           prefetch_ = false;
         }
@@ -652,12 +660,12 @@ struct batch_load_iterator {
      * Passthrough: pure bookkeeping; the per-batch view is recomputed on demand by `view()` via
      * `cuda::std::submdspan`, never via pointer arithmetic on the input mdspan.
      *
-     * Copy_device, prefetch=true: swap the ring slots and host-sync `copy_stream` so the
-     * swapped-in slot is fully staged before the user's next kernel runs. The slot we swapped
-     * out (now `prefetch_dev_ptr_`) carried the just-completed kernel's writes; if `host_writeback`
-     * is on, its writeback is recorded for the *next* `prefetch_next_batch()` to flush -- when
-     * that slot is about to be overwritten by a new H2D, by which time the kernel that wrote it
-     * is two iterations old and guaranteed finished (the legacy 2-iteration-delay model).
+     * Copy_device, prefetch=true: swap the ring slots, then make the main stream wait on
+     * `h2d_done_` so the swapped-in slot is fully staged before the user's next kernel reads it,
+     * and record `kernel_done_` for the next `prefetch()` to gate on. The slot we swapped out
+     * (now `prefetch_dev_ptr_`) carried the previous kernel's writes; if `host_writeback` is on,
+     * its writeback is recorded for the *next* `prefetch_next_batch()` to flush -- when that slot
+     * is about to be overwritten by a new H2D (the 2-iteration-delay model).
      *
      * Copy_device, prefetch=false: synchronously stage H2D into the single buffer and host-sync
      * `copy_stream`.
@@ -701,9 +709,15 @@ struct batch_load_iterator {
           }
           std::swap(dev_ptr_, prefetch_dev_ptr_);
           prefetch_pos_.reset();
-          // Ensure prefetch_next_batch()'s queued H2D into this slot (and any prior D2H of the
-          // slot from the previous overwrite) finished before the user kernel reads it.
-          copy_stream_.synchronize();
+          // Mark where the main stream stands *before* the caller enqueues this batch's kernel:
+          // everything up to and including the previous batch's kernel is enqueued by now, which
+          // is exactly the dependency the next `prefetch()` needs before it may overwrite the slot
+          // we just retired. Recording here (rather than in `prefetch()`) is what makes the
+          // ordering independent of where the caller places its `prefetch_next_batch()` call.
+          RAFT_CUDA_TRY(cudaEventRecord(kernel_done_, raft::resource::get_cuda_stream(*res_)));
+          // The user kernel must not read the swapped-in slot until its H2D has landed. A device
+          // event, not a host stall: the host stays free to run ahead and queue more work.
+          RAFT_CUDA_TRY(cudaStreamWaitEvent(raft::resource::get_cuda_stream(*res_), h2d_done_, 0));
         } else {
           // Non-pipelined fast path (prefetch_=false, or prefetch_pos_ didn't match).
           if (host_writeback_ && dirty_cur_ && pos_.has_value()) {
@@ -729,15 +743,13 @@ struct batch_load_iterator {
      *
      * On `copy_stream`, queues -- in this order, into the *prefetch* slot only:
      *   1. D2H of the prefetch slot's stale kernel output (if `host_writeback` and the slot was
-     *      written by a kernel two iterations ago). The kernel that produced that output is
-     *      already finished by main-stream FIFO (the user has since enqueued the kernel for
-     *      the slot currently in `dev_ptr_`), so no event is needed -- the D2H reads a slot the
-     *      main stream is no longer touching.
+     *      written by a kernel two iterations ago).
      *   2. H2D of `pos` into the prefetch slot (if `initialize`).
      *
-     * Then host-stalls on `res`'s main stream so the host has waited out the just-enqueued user
-     * kernel by the time control returns; meanwhile the D2H/H2D queued above runs concurrently
-     * on `copy_stream`, overlapping the writeback with the kernel.
+     * Both are gated on `kernel_done_` (the main-stream position recorded by the last `load()`)
+     * so the slot is not recycled under a still-running kernel, and the new copy-stream position
+     * is published in `h2d_done_` for the `load()` that will hand this slot out. The host never
+     * blocks, so it can stay ahead of both streams.
      *
      * No-op if prefetch is disabled, source is null, passthrough, or `pos >= n_iters_`.
      */
@@ -750,11 +762,16 @@ struct batch_load_iterator {
         return;
       }
 
+      // The slot we are about to overwrite was last read (and, with writeback, written) by the
+      // previous batch's kernel. `kernel_done_` was recorded by the last `load()`, i.e. at a point
+      // where that kernel was already enqueued, so waiting on it here is precisely the
+      // two-iterations-back guarantee -- without waiting for the kernel of the *current* batch,
+      // which is what must overlap these copies.
+      RAFT_CUDA_TRY(cudaStreamWaitEvent(copy_stream_, kernel_done_, 0));
+
       // 2-iteration-delayed writeback: the prefetch slot still holds kernel output from two
       // iterations ago (from when this slot was last `dev_ptr_`); D2H it now -- right before we
-      // overwrite the slot with the next H2D. The kernel that wrote it is past on the main
-      // stream, so this D2H runs concurrently with the just-enqueued kernel for `dev_ptr_`
-      // without racing (different slots).
+      // overwrite the slot with the next H2D.
       if (host_writeback_ && prefetch_dirty_pos_.has_value()) {
         queue_d2h(prefetch_dev_ptr_, *prefetch_dirty_pos_);
         prefetch_dirty_pos_.reset();
@@ -770,11 +787,10 @@ struct batch_load_iterator {
       }
       prefetch_pos_.emplace(pos);
 
-      // Host-stall on the user's main stream: the just-enqueued kernel runs concurrently with
-      // the copies above. By the time control returns, the kernel is done and the next load()
-      // can safely read its writes (still in `dev_ptr_`'s slot, which becomes prefetch_dev_ptr_
-      // after the upcoming swap).
-      raft::resource::sync_stream(*res_);
+      // Publish the copy-stream position so the `load()` that swaps this slot in can gate the
+      // user kernel on it. Recorded unconditionally so it always reflects the latest copy work,
+      // including the writeback-only case where no H2D was queued.
+      RAFT_CUDA_TRY(cudaEventRecord(h2d_done_, copy_stream_));
     }
 
     void queue_h2d(element_type* dst, size_type src_row_offset, size_type num_rows)
@@ -820,6 +836,15 @@ struct batch_load_iterator {
 
     rmm::device_uvector<value_type_d> buf_0_;
     rmm::device_uvector<value_type_d> buf_1_;
+
+    // Cross-stream ordering for the pipelined path; null unless `prefetch_` survived construction.
+    //  * `h2d_done_`    copy-stream position after the staging copies (recorded by `prefetch()`).
+    //  * `kernel_done_` main-stream position before the current batch's kernel (recorded by
+    //                   `load()`), i.e. through the *previous* batch's kernel.
+    // Waiting on a never-recorded event is a documented no-op, so the first iteration needs no
+    // special casing.
+    cudaEvent_t h2d_done_    = nullptr;
+    cudaEvent_t kernel_done_ = nullptr;
 
     // Slot bookkeeping (only meaningful for !kPassthrough).
     element_type* dev_ptr_          = nullptr;
@@ -893,11 +918,31 @@ struct batch_load_iterator {
 
   /** Whether iteration copies the data on each step (i.e. not passthrough). */
   [[nodiscard]] auto does_copy() const -> bool { return !kPassthrough; }
-  /** Reset the iterator (and prefetch) position to begin(). Reusable iteration. */
+  /**
+   * Reset the iterator (and prefetch) position to begin(). Reusable iteration.
+   *
+   * An in-flight prefetch of batch 0 is kept rather than re-issued, so a caller that primes the
+   * next pass before the end of the current one (see `prime()`) does not pay for the same staging
+   * copy twice.
+   */
   void reset()
   {
-    cur_pos_          = 0;
-    cur_prefetch_pos_ = 0;
+    cur_pos_ = 0;
+    const bool batch_0_staged =
+      cur_batch_->prefetch_pos_.has_value() && *cur_batch_->prefetch_pos_ == 0;
+    cur_prefetch_pos_ = batch_0_staged ? 1 : 0;
+  }
+  /**
+   * Rewind and make sure batch 0 is staged, without re-staging it if it already is.
+   *
+   * Idempotent, which is what lets a multi-pass caller prime the next pass early -- while the
+   * current pass's kernels still occupy the main stream and before any host stall -- and still
+   * call `prime()` again at the top of that pass without issuing a duplicate transfer.
+   */
+  void prime()
+  {
+    reset();
+    if (cur_prefetch_pos_ == 0) { prefetch_next_batch(); }
   }
   /** Reset the iterator (and prefetch) position to end(). */
   void reset_to_end()
@@ -1074,6 +1119,10 @@ class batch_load_iterator_dyn {
   void reset()
   {
     std::visit([](auto& it) { it.reset(); }, impl_);
+  }
+  void prime()
+  {
+    std::visit([](auto& it) { it.prime(); }, impl_);
   }
   void reset_to_end()
   {

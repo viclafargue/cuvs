@@ -490,6 +490,61 @@ void cluster_cost(
     handle, min_cluster_distance, workspace, cost, raft::identity_op{}, raft::add_op{});
 }
 
+/**
+ * Weighted 1-NN cost of a batch, computed with the same fused argmin kernel the assignment pass
+ * uses.
+ *
+ * `cluster_cost` reaches the same result through `minClusterDistanceCompute`, which materializes
+ * the distance tile and then reduces it; measured on a streaming fit that is about 2x slower than
+ * the fused path for identical input. The label produced here is discarded -- the only reason to
+ * take the fused route is throughput.
+ *
+ * @param[out]   min_cluster_and_distance  Scratch <label, distance> vector [batch rows]
+ * @param[out]   cost                      This batch's summed (weighted) cost
+ */
+template <typename DataT, typename IndexT>
+void cluster_cost_fused(
+  raft::resources const& handle,
+  raft::device_matrix_view<const DataT, IndexT> X,
+  raft::device_matrix_view<const DataT, IndexT> centroids,
+  raft::device_vector_view<raft::KeyValuePair<IndexT, DataT>, IndexT> min_cluster_and_distance,
+  raft::device_vector_view<const DataT, IndexT> l2_norm_x,
+  rmm::device_uvector<DataT>& l2_norm_or_distance_buffer,
+  cuvs::distance::DistanceType metric,
+  int batch_samples,
+  int batch_centroids,
+  rmm::device_uvector<char>& workspace,
+  raft::device_scalar_view<DataT> cost,
+  std::optional<raft::device_vector_view<const DataT, IndexT>> sample_weight = std::nullopt)
+{
+  minClusterAndDistanceCompute<DataT, IndexT>(handle,
+                                              X,
+                                              centroids,
+                                              min_cluster_and_distance,
+                                              l2_norm_x,
+                                              l2_norm_or_distance_buffer,
+                                              metric,
+                                              batch_samples,
+                                              batch_centroids,
+                                              workspace);
+
+  if (sample_weight.has_value()) {
+    raft::linalg::map(
+      handle,
+      min_cluster_and_distance,
+      [] __device__(const raft::KeyValuePair<IndexT, DataT> kvp, DataT wt) {
+        raft::KeyValuePair<IndexT, DataT> res;
+        res.key   = kvp.key;
+        res.value = kvp.value * wt;
+        return res;
+      },
+      raft::make_const_mdspan(min_cluster_and_distance),
+      sample_weight.value());
+  }
+  computeClusterCost(
+    handle, min_cluster_and_distance, workspace, cost, raft::value_op{}, raft::add_op{});
+}
+
 template <typename DataT, typename IndexT>
 void countSamplesInCluster(raft::resources const& handle,
                            const cuvs::cluster::kmeans::params& params,

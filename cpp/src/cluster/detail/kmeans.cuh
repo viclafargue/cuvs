@@ -688,9 +688,8 @@ void kmeans_fit(
 
   auto minClusterAndDistance = raft::make_device_vector<raft::KeyValuePair<IndexT, DataT>, IndexT>(
     handle, device_buffer_samples);
-  auto minClusterDistance = raft::make_device_vector<DataT, IndexT>(handle, device_buffer_samples);
-  auto L2NormBatch        = raft::make_device_vector<DataT, IndexT>(handle, device_buffer_samples);
-  auto batch_weights_buf  = raft::make_device_vector<DataT, IndexT>(handle, device_buffer_samples);
+  auto L2NormBatch       = raft::make_device_vector<DataT, IndexT>(handle, device_buffer_samples);
+  auto batch_weights_buf = raft::make_device_vector<DataT, IndexT>(handle, device_buffer_samples);
   rmm::device_uvector<DataT> L2NormBuf_OR_DistBuf(0, stream);
 
   auto centroid_sums      = raft::make_device_matrix<DataT, IndexT>(handle, n_clusters, n_features);
@@ -698,6 +697,7 @@ void kmeans_fit(
   auto clustering_cost    = raft::make_device_scalar<DataT>(handle, DataT{0});
   auto batch_inertia      = raft::make_device_scalar<DataT>(handle, DataT{0});
   auto batch_cost         = raft::make_device_scalar<DataT>(handle, DataT{0});
+  auto h_inertia          = raft::make_pinned_scalar<DataT>(handle, DataT{0});
 
   rmm::device_uvector<char> batch_workspace(device_buffer_samples, stream);
 
@@ -864,8 +864,9 @@ void kmeans_fit(
       auto new_centroids_view =
         raft::make_device_matrix_view<DataT, IndexT>(new_centroids_ptr, n_clusters, n_features);
 
-      data_batches.reset();
-      data_batches.prefetch_next_batch();
+      // Stage batch 0. From the second iteration on this is a no-op: the tail of the previous
+      // iteration already primed it, back when the GPU was still busy.
+      data_batches.prime();
       using wt_iter_t = cuvs::spatial::knn::detail::utils::batch_load_iterator_dyn<DataT>;
       std::optional<wt_iter_t> wt_it;
       if (weight_batches.has_value()) {
@@ -876,7 +877,13 @@ void kmeans_fit(
       for (const auto& data_batch : data_batches) {
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;
+        // Dereferencing loads the batch, so this must precede the prefetch of the *next* one.
         if (wt_it.has_value()) { wt_data = (**wt_it).data(); }
+
+        // Submit the next batch's staging copies before enqueueing this batch's kernels: the
+        // transfers then reach the GPU ahead of ~1k kernel launches rather than behind them.
+        data_batches.prefetch_next_batch();
+        if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
 
         auto batch_data_view = raft::make_device_matrix_view<const DataT, IndexT>(
           data_batch.data(), cur_batch_size, n_features);
@@ -922,13 +929,7 @@ void kmeans_fit(
                                      clustering_cost.view(),
                                      batch_workspace,
                                      batch_cost.view());
-        // Queue the next batch's H2D now: it runs on the copy stream while the kernels just
-        // enqueued above execute on the main stream.
-        data_batches.prefetch_next_batch();
-        if (wt_it.has_value()) {
-          wt_it->prefetch_next_batch();
-          ++(*wt_it);
-        }
+        if (wt_it.has_value()) { ++(*wt_it); }
       }
       if (need_compute_norms) { norms_cached = true; }
 
@@ -963,6 +964,12 @@ void kmeans_fit(
       raft::copy(handle,
                  raft::make_pinned_scalar_view(h_done_flag.data_handle()),
                  raft::make_device_scalar_view<const int>(d_done_flag.data_handle()));
+
+      // Stage batch 0 for whatever comes next -- another iteration, or the inertia pass below.
+      // This has to happen before the host blocks on `h_done_flag` at the top of the next
+      // iteration, otherwise the transfer is only submitted once the GPU has gone idle and the
+      // pass starts with a full batch of non-overlapped copy.
+      data_batches.prime();
     }
 
     {
@@ -971,8 +978,8 @@ void kmeans_fit(
 
       DataT zero = DataT{0};
       raft::copy(clustering_cost.data_handle(), &zero, 1, stream);
-      data_batches.reset();
-      data_batches.prefetch_next_batch();
+      // Already staged by the tail of the last assignment iteration; no-op here.
+      data_batches.prime();
       using wt_iter_t = cuvs::spatial::knn::detail::utils::batch_load_iterator_dyn<DataT>;
       std::optional<wt_iter_t> wt_it;
       if (weight_batches.has_value()) {
@@ -984,6 +991,9 @@ void kmeans_fit(
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;
         if (wt_it.has_value()) { wt_data = (**wt_it).data(); }
+
+        data_batches.prefetch_next_batch();
+        if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
 
         auto batch_data_view = raft::make_device_matrix_view<const DataT, IndexT>(
           data_batch.data(), cur_batch_size, n_features);
@@ -1000,10 +1010,10 @@ void kmeans_fit(
         } else {
           compute_batch_norms(data_batch.data(), cur_batch_size);
         }
-        auto l2_norm_view =
-          raft::make_device_vector_view<DataT, IndexT>(L2NormBatch.data_handle(), cur_batch_size);
-        auto min_distance_view = raft::make_device_vector_view<DataT, IndexT>(
-          minClusterDistance.data_handle(), cur_batch_size);
+        auto l2_const_view = raft::make_device_vector_view<const DataT, IndexT>(
+          L2NormBatch.data_handle(), cur_batch_size);
+        auto minCAD_view = raft::make_device_vector_view<raft::KeyValuePair<IndexT, DataT>, IndexT>(
+          minClusterAndDistance.data_handle(), cur_batch_size);
         std::optional<raft::device_vector_view<const DataT, IndexT>> batch_sample_weight =
           std::nullopt;
         if (weight_ptr != nullptr) {
@@ -1011,33 +1021,32 @@ void kmeans_fit(
             cur_batch_weights(static_cast<IndexT>(data_batch.offset()), wt_data, cur_batch_size);
         }
 
-        cluster_cost(handle,
-                     batch_data_view,
-                     centroids_const,
-                     min_distance_view,
-                     l2_norm_view,
-                     L2NormBuf_OR_DistBuf,
-                     cuvs::distance::DistanceType::L2Expanded,
-                     iter_params.batch_samples,
-                     iter_params.batch_centroids,
-                     ws,
-                     batch_inertia.view(),
-                     batch_sample_weight);
+        cluster_cost_fused<DataT, IndexT>(handle,
+                                          batch_data_view,
+                                          centroids_const,
+                                          minCAD_view,
+                                          l2_const_view,
+                                          L2NormBuf_OR_DistBuf,
+                                          cuvs::distance::DistanceType::L2Expanded,
+                                          iter_params.batch_samples,
+                                          iter_params.batch_centroids,
+                                          ws,
+                                          batch_inertia.view(),
+                                          batch_sample_weight);
         raft::linalg::add(clustering_cost.data_handle(),
                           clustering_cost.data_handle(),
                           batch_inertia.data_handle(),
                           1,
                           stream);
-        // Queue the next batch's H2D now: it runs on the copy stream while the kernels just
-        // enqueued above execute on the main stream.
-        data_batches.prefetch_next_batch();
-        if (wt_it.has_value()) {
-          wt_it->prefetch_next_batch();
-          ++(*wt_it);
-        }
+        if (wt_it.has_value()) { ++(*wt_it); }
       }
-      raft::copy(&iter_inertia, clustering_cost.data_handle(), 1, stream);
+      // Pinned destination: a pageable one turns this into a host-blocking copy that waits out the
+      // whole pass's remaining kernels before it can even start.
+      raft::copy(handle,
+                 raft::make_pinned_scalar_view(h_inertia.data_handle()),
+                 raft::make_device_scalar_view<const DataT>(clustering_cost.data_handle()));
       raft::resource::sync_stream(handle);
+      iter_inertia = *h_inertia.data_handle();
     }
 
     if (iter_inertia < inertia[0]) {

@@ -23,6 +23,7 @@ COMPUTE_BATCH_ROWS=${COMPUTE_BATCH_ROWS:-65536}
 command -v "$PYTHON_BIN" >/dev/null
 command -v "$NSYS_BIN" >/dev/null
 test -f "$ROOT_DIR/bench_ooc_kmeans.py"
+test -f "$ROOT_DIR/ooc_report.py"
 mkdir -p "$OUTPUT_DIR"
 
 output="$OUTPUT_DIR/ooc_pinned"
@@ -51,4 +52,4 @@ if [[ ! -s "${output}.nsys-rep" ]]; then
 fi
 
 echo
-"$PYTHON_BIN" "$OUTPUT_DIR/ooc_report.py" "${output}.nsys-rep"
+"$PYTHON_BIN" "$ROOT_DIR/ooc_report.py" "${output}.nsys-rep"
