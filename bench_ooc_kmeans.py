@@ -2,12 +2,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Profile host-to-device streaming in single-GPU out-of-core K-means."""
+"""Profile host-to-device streaming in single-GPU out-of-core K-means.
+
+The dataset is always allocated in pinned host memory: `cudaMemcpyAsync` on
+pageable memory blocks the calling thread for the whole transfer, so the
+double-buffered prefetch in the batch iterator cannot overlap anything.
+
+By default the whole run is served from a pre-reserved RMM pool. Without it,
+per-batch temporaries (the CUTLASS mutex array in the fused 1-NN kernel, cuB
+scratch, ...) hit `cudaMalloc`/`cudaFree`, and `cudaFree` synchronizes the whole
+device -- which serializes the copy stream against the compute stream and
+destroys the overlap. Use --no-rmm-pool to measure that effect.
+"""
 
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
 import numpy as np
@@ -19,25 +29,16 @@ GIB = 1 << 30
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--memory", choices=("pageable", "pinned"), required=True
-    )
-    parser.add_argument(
-        "--prefetch",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable the temporary C++ double-buffered prefetch path.",
-    )
-    parser.add_argument(
         "--dataset-gib",
         type=float,
         default=160.0,
-        help="Host dataset size in GiB (default: 160).",
+        help="Pinned host dataset size in GiB (default: 160).",
     )
     parser.add_argument(
         "--batch-gib",
         type=float,
-        default=40.0,
-        help="Size of each streamed GPU batch in GiB (default: 40).",
+        default=32.0,
+        help="Size of each streamed GPU batch in GiB (default: 32).",
     )
     parser.add_argument("--features", type=int, default=256)
     parser.add_argument("--clusters", type=int, default=1024)
@@ -47,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=65_536,
         help="Sample tile used by the inner 1-NN computation.",
+    )
+    parser.add_argument(
+        "--rmm-pool",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pre-reserve an RMM pool so the fit issues no driver allocations.",
     )
     parser.add_argument(
         "--fill-template-mib",
@@ -85,11 +92,24 @@ def host_available_bytes() -> int | None:
     return None
 
 
-def allocate_dataset(cp, memory: str, shape: tuple[int, int]):
-    nbytes = int(np.prod(shape)) * np.dtype(np.float32).itemsize
-    if memory == "pageable":
-        return np.empty(shape, dtype=np.float32), None
+def device_pool_bytes(
+    batch_rows: int, batch_bytes: int, tile_rows: int, clusters: int
+) -> int:
+    """Device memory the streaming fit needs, for pre-reserving the RMM pool.
 
+    Two staging buffers hold the current and the prefetched batch. On top of
+    that the fit keeps a few per-row vectors alive (the <label, distance> pairs
+    dominate at 16 B/row) and a distance tile for the inner 1-NN computation.
+    """
+    per_row = (
+        16 + 3 * 4 + 1 + 1
+    )  # <label,distance>, 3 float vectors, 2 byte buffers
+    tile_scratch = tile_rows * clusters * np.dtype(np.float32).itemsize
+    return 2 * batch_bytes + batch_rows * per_row + tile_scratch + GIB // 2
+
+
+def allocate_pinned_dataset(cp, shape: tuple[int, int]):
+    nbytes = int(np.prod(shape)) * np.dtype(np.float32).itemsize
     try:
         owner = cp.cuda.alloc_pinned_memory(nbytes)
     except cp.cuda.runtime.CUDARuntimeError as error:
@@ -117,9 +137,6 @@ def initialize_dataset(
 def main() -> None:
     args = parse_args()
 
-    # Read by the temporary C++ batch iterator implementation.
-    os.environ["CUVS_KMEANS_OOC_PREFETCH"] = "1" if args.prefetch else "0"
-
     import cupy as cp
     from cuvs.cluster import kmeans
 
@@ -128,6 +145,7 @@ def main() -> None:
     shape = (rows, args.features)
     dataset_bytes = rows * args.features * np.dtype(np.float32).itemsize
     batch_bytes = batch_rows * args.features * np.dtype(np.float32).itemsize
+    n_batches = -(-rows // batch_rows)
 
     available = host_available_bytes()
     if available is not None and dataset_bytes > int(available * 0.9):
@@ -140,30 +158,38 @@ def main() -> None:
     cp.cuda.runtime.getDeviceCount()
     cp.cuda.Device().synchronize()
     free_device, total_device = cp.cuda.Device().mem_info
-    workspace_limit = int(total_device * 0.9)
-    os.environ["CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES"] = str(workspace_limit)
-    resident_batches = 2 if args.prefetch else 1
-    transfer_buffers = resident_batches * batch_bytes
-    if transfer_buffers > int(total_device * 0.9):
+
+    pool_bytes = device_pool_bytes(
+        batch_rows, batch_bytes, args.compute_batch_rows, args.clusters
+    )
+    if pool_bytes > free_device:
         raise RuntimeError(
-            f"The transfer buffers alone need {transfer_buffers / GIB:.2f} GiB "
-            f"but the GPU has {total_device / GIB:.2f} GiB"
+            f"Streaming {batch_bytes / GIB:.2f} GiB batches needs about "
+            f"{pool_bytes / GIB:.2f} GiB on the device (two staging buffers plus "
+            f"per-row scratch) but only {free_device / GIB:.2f} GiB is free. "
+            f"Lower --batch-gib."
         )
+    if args.rmm_pool:
+        import rmm
+
+        # Uncapped so a short estimate degrades into a few extra cudaMallocs
+        # rather than a bad_alloc.
+        rmm.reinitialize(pool_allocator=True, initial_pool_size=pool_bytes)
 
     print(
-        f"Allocating {args.memory} dataset: shape={shape}, "
+        f"Allocating pinned dataset: shape={shape}, "
         f"size={dataset_bytes / GIB:.2f} GiB",
         flush=True,
     )
-    dataset, pinned_owner = allocate_dataset(cp, args.memory, shape)
+    dataset, pinned_owner = allocate_pinned_dataset(cp, shape)
     initialize_dataset(dataset, args.fill_template_mib, args.seed)
 
     print(
         f"GPU={total_device / GIB:.2f} GiB total, "
         f"{free_device / GIB:.2f} GiB free; "
-        f"streaming_batch={batch_rows} rows ({batch_bytes / GIB:.2f} GiB); "
-        f"transfer_buffers~={transfer_buffers / GIB:.2f} GiB; "
-        f"workspace_limit={workspace_limit / GIB:.2f} GiB",
+        f"streaming_batch={batch_rows} rows ({batch_bytes / GIB:.2f} GiB) "
+        f"x {n_batches} batches/pass; "
+        f"rmm_pool={'%.2f GiB' % (pool_bytes / GIB) if args.rmm_pool else 'off'}",
         flush=True,
     )
 
@@ -177,7 +203,7 @@ def main() -> None:
         device_buffer_samples=batch_rows,
     )
 
-    range_name = f"ooc_kmeans/{args.memory}/prefetch_{int(args.prefetch)}"
+    range_name = "ooc_kmeans/pinned"
     print(f"NVTX capture range: {range_name}", flush=True)
     cp.cuda.runtime.profilerStart()
     cp.cuda.nvtx.RangePush(range_name)
@@ -194,10 +220,18 @@ def main() -> None:
 
     # Keep both allocations alive through the end of the captured fit.
     _ = pinned_owner, centroids
-    logical_gib = dataset_bytes * n_iter / GIB
+
+    # One pass per Lloyd iteration, plus the final pass that recomputes inertia
+    # against the converged centroids.
+    passes = n_iter + 1
+    moved_gib = dataset_bytes * passes / GIB
     print(
-        f"elapsed={elapsed:.3f}s, iterations={n_iter}, inertia={inertia:.6g}, "
-        f"dataset_GiB*iterations={logical_gib:.2f}",
+        f"elapsed={elapsed:.3f}s, iterations={n_iter}, inertia={inertia:.6g}",
+        flush=True,
+    )
+    print(
+        f"host->device minimum={moved_gib:.2f} GiB over {passes} passes "
+        f"=> {moved_gib / elapsed:.1f} GiB/s effective",
         flush=True,
     )
 

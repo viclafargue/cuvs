@@ -49,7 +49,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
 #include <limits>
 #include <optional>
@@ -597,16 +596,6 @@ void kmeans_fit(
   }
 
   constexpr bool data_on_device = raft::is_device_mdspan_v<decltype(X)>;
-  if constexpr (!data_on_device) {
-    if (const char* value = std::getenv("CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES")) {
-      char* end       = nullptr;
-      auto byte_limit = std::strtoull(value, &end, 10);
-      RAFT_EXPECTS(end != value && *end == '\0' && byte_limit > 0,
-                   "CUVS_KMEANS_OOC_WORKSPACE_LIMIT_BYTES must be a positive integer");
-      raft::resource::set_workspace_to_global_resource(const_cast<raft::resources&>(handle),
-                                                       static_cast<std::size_t>(byte_limit));
-    }
-  }
 
   const DataT* weight_ptr =
     sample_weight.has_value() ? sample_weight.value().data_handle() : nullptr;
@@ -708,10 +697,14 @@ void kmeans_fit(
   auto weight_per_cluster = raft::make_device_vector<DataT, IndexT>(handle, n_clusters);
   auto clustering_cost    = raft::make_device_scalar<DataT>(handle, DataT{0});
   auto batch_inertia      = raft::make_device_scalar<DataT>(handle, DataT{0});
+  auto batch_cost         = raft::make_device_scalar<DataT>(handle, DataT{0});
 
   rmm::device_uvector<char> batch_workspace(device_buffer_samples, stream);
 
-  auto batch_mr = raft::resource::get_workspace_resource_ref(handle);
+  // Host-input staging buffers are sized by the user via `device_buffer_samples` and routinely
+  // exceed the workspace allocation limit, so they come from the large-workspace resource.
+  auto batch_mr = data_on_device ? raft::resource::get_workspace_resource_ref(handle)
+                                 : raft::resource::get_large_workspace_resource_ref(handle);
 
   // Use the caller's stream pool for host-input staging. If no pool is configured, this falls
   // back to the main stream and disables cross-stream prefetching.
@@ -880,8 +873,6 @@ void kmeans_fit(
         wt_it = weight_batches->begin();
         wt_it->prefetch_next_batch();
       }
-      data_batches.prefetch_next_batch();
-      if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
       for (const auto& data_batch : data_batches) {
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;
@@ -929,9 +920,10 @@ void kmeans_fit(
                                      centroid_sums.view(),
                                      weight_per_cluster.view(),
                                      clustering_cost.view(),
-                                     batch_workspace);
-        data_batches.prefetch_next_batch();
-        if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
+                                     batch_workspace,
+                                     batch_cost.view());
+        // Queue the next batch's H2D now: it runs on the copy stream while the kernels just
+        // enqueued above execute on the main stream.
         data_batches.prefetch_next_batch();
         if (wt_it.has_value()) {
           wt_it->prefetch_next_batch();
@@ -988,8 +980,6 @@ void kmeans_fit(
         wt_it = weight_batches->begin();
         wt_it->prefetch_next_batch();
       }
-      data_batches.prefetch_next_batch();
-      if (wt_it.has_value()) { wt_it->prefetch_next_batch(); }
       for (const auto& data_batch : data_batches) {
         IndexT cur_batch_size = static_cast<IndexT>(data_batch.size());
         const DataT* wt_data  = nullptr;
@@ -1028,8 +1018,8 @@ void kmeans_fit(
                      l2_norm_view,
                      L2NormBuf_OR_DistBuf,
                      cuvs::distance::DistanceType::L2Expanded,
-                     cur_batch_size,
-                     n_clusters,
+                     iter_params.batch_samples,
+                     iter_params.batch_centroids,
                      ws,
                      batch_inertia.view(),
                      batch_sample_weight);
@@ -1038,6 +1028,8 @@ void kmeans_fit(
                           batch_inertia.data_handle(),
                           1,
                           stream);
+        // Queue the next batch's H2D now: it runs on the copy stream while the kernels just
+        // enqueued above execute on the main stream.
         data_batches.prefetch_next_batch();
         if (wt_it.has_value()) {
           wt_it->prefetch_next_batch();

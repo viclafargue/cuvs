@@ -9,12 +9,12 @@ cd "$ROOT_DIR"
 
 PYTHON_BIN=${PYTHON_BIN:-python}
 NSYS_BIN=${NSYS_BIN:-nsys}
-OUTPUT_DIR=${NSYS_OUTPUT_DIR:-"$ROOT_DIR/nsys_ooc_kmeans"}
+OUTPUT_DIR=${NSYS_OUTPUT_DIR:-"$ROOT_DIR/ooc-kmeans-profile"}
 
-# Defaults target a 96 GiB RTX PRO 6000: prefetching holds about two 40 GiB
-# transfer buffers while the 160 GiB host dataset remains out of core.
+# Defaults target a 96 GiB RTX PRO 6000: two 32 GiB staging buffers plus per-row
+# scratch stay under the RMM pool while the 160 GiB pinned dataset is out of core.
 DATASET_GIB=${DATASET_GIB:-160}
-BATCH_GIB=${BATCH_GIB:-40}
+BATCH_GIB=${BATCH_GIB:-32}
 FEATURES=${FEATURES:-256}
 CLUSTERS=${CLUSTERS:-1024}
 MAX_ITER=${MAX_ITER:-3}
@@ -25,51 +25,30 @@ command -v "$NSYS_BIN" >/dev/null
 test -f "$ROOT_DIR/bench_ooc_kmeans.py"
 mkdir -p "$OUTPUT_DIR"
 
-run_case() {
-  local memory=$1
-  local prefetch=$2
-  local buffering output prefetch_arg
+output="$OUTPUT_DIR/ooc_pinned"
 
-  if [[ $prefetch == 1 ]]; then
-    buffering=prefetch
-    prefetch_arg=--prefetch
-  else
-    buffering=single
-    prefetch_arg=--no-prefetch
-  fi
+echo "Profiling pinned out-of-core K-means"
+echo "Output: ${output}.nsys-rep"
 
-  output="$OUTPUT_DIR/ooc_${memory}_${buffering}"
+"$NSYS_BIN" profile \
+  --trace=cuda,nvtx,osrt \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop \
+  --force-overwrite=true \
+  -o "$output" \
+  "$PYTHON_BIN" "$ROOT_DIR/bench_ooc_kmeans.py" \
+    --dataset-gib "$DATASET_GIB" \
+    --batch-gib "$BATCH_GIB" \
+    --features "$FEATURES" \
+    --clusters "$CLUSTERS" \
+    --max-iter "$MAX_ITER" \
+    --compute-batch-rows "$COMPUTE_BATCH_ROWS" \
+    "$@"
 
-  echo
-  echo "Profiling memory=$memory buffering=$buffering"
-  echo "Output: ${output}.nsys-rep"
-
-  "$NSYS_BIN" profile \
-    --trace=cuda,nvtx,osrt \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end=stop \
-    --force-overwrite=true \
-    -o "$output" \
-    "$PYTHON_BIN" "$ROOT_DIR/bench_ooc_kmeans.py" \
-      --memory "$memory" \
-      "$prefetch_arg" \
-      --dataset-gib "$DATASET_GIB" \
-      --batch-gib "$BATCH_GIB" \
-      --features "$FEATURES" \
-      --clusters "$CLUSTERS" \
-      --max-iter "$MAX_ITER" \
-      --compute-batch-rows "$COMPUTE_BATCH_ROWS"
-
-  if [[ ! -s "${output}.nsys-rep" && ! -s "${output}.qdrep" ]]; then
-    echo "ERROR: Nsight Systems did not generate a report for $memory/$buffering" >&2
-    return 1
-  fi
-}
-
-run_case pageable 0
-run_case pageable 1
-run_case pinned 0
-run_case pinned 1
+if [[ ! -s "${output}.nsys-rep" ]]; then
+  echo "ERROR: Nsight Systems did not generate a report" >&2
+  exit 1
+fi
 
 echo
-echo "Profiles written to $OUTPUT_DIR"
+"$PYTHON_BIN" "$OUTPUT_DIR/ooc_report.py" "${output}.nsys-rep"

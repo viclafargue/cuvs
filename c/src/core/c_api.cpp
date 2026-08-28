@@ -9,12 +9,14 @@
 #include <raft/core/device_resources_snmg.hpp>
 #include <raft/core/memory_tracking_resources.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/cuda_stream_pool.hpp>
 #include <raft/core/resource/device_id.hpp>
 #include <raft/core/resource/device_memory_resource.hpp>
 #include <raft/core/resource/resource_types.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/util/cudart_utils.hpp>
 #include <rapids_logger/logger.hpp>
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -37,7 +39,11 @@ extern "C" cuvsError_t cuvsResourcesCreate(cuvsResources_t* res)
 {
   return cuvs::core::translate_exceptions([=] {
     auto res_ptr = new raft::resources{};
-    *res         = reinterpret_cast<uintptr_t>(res_ptr);
+    // A single pool stream is what the host-data code paths use to stage H2D copies concurrently
+    // with compute on the main stream (see `get_prefetch_stream`). Without it those paths fall
+    // back to the main stream and every transfer serializes against the kernels.
+    raft::resource::set_cuda_stream_pool(*res_ptr, std::make_shared<rmm::cuda_stream_pool>(1));
+    *res = reinterpret_cast<uintptr_t>(res_ptr);
   });
 }
 
@@ -67,6 +73,7 @@ extern "C" cuvsError_t cuvsResourcesCreateWithMemoryTracking(cuvsResources_t* re
     }
     auto res_ptr = new raft::memory_tracking_resources{
       std::string{csv_path}, std::chrono::milliseconds{sample_interval_ms}};
+    raft::resource::set_cuda_stream_pool(*res_ptr, std::make_shared<rmm::cuda_stream_pool>(1));
     *res = reinterpret_cast<uintptr_t>(res_ptr);
   });
 }

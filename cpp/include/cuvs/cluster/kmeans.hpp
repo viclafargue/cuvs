@@ -153,10 +153,11 @@ struct params : base_params {
    * count. This is ignored by device-data overloads.
    *
    * Host rows are staged through a device buffer of size
-   * `device_buffer_samples * n_features`. If the resources handle has a CUDA
-   * stream pool with at least one stream, prefetch is enabled; that
-   * doubles the batch memory footprint (and the weight-staging footprint
-   * when sample weights are provided).
+   * `device_buffer_samples * n_features`, allocated from the large-workspace
+   * resource so it is not bounded by the workspace allocation limit. If the
+   * resources handle has a CUDA stream pool with at least one stream, prefetch
+   * is enabled; that doubles the batch memory footprint (and the
+   * weight-staging footprint when sample weights are provided).
    *
    * Default: 0 (process all data at once).
    */
