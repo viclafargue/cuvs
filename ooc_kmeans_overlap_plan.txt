@@ -1,0 +1,143 @@
+Clean out-of-core KMeans overlap plan
+=====================================
+
+Goal
+----
+Keep the observable KMeans result unchanged while making the host-data path a true
+two-slot pipeline:
+
+  H2D(batch 0), H2D(batch 1), H2D(batch 2), ...
+       compute(0)    compute(1)    compute(2) ...
+
+The first two transfers must be submitted back-to-back. Compute for batch 0 must become
+eligible as soon as H2D(0) completes, and each completed batch must recycle its slot for the
+next transfer. At the final batch, prefetch batch 0 of the next Lloyd iteration so the pipeline
+is cyclic.
+
+Audit of the prototype versus main
+----------------------------------
+The prototype branch contains useful fixes mixed with benchmark changes, profiling experiments,
+norm-cache sidecars, documentation churn, and unrelated branch divergence. Only these mechanisms
+are required for the overlap goal:
+
+1. The batch iterator needs two device slots, a dedicated copy stream, and cross-stream CUDA
+   events. It must not synchronize either stream from the host in the steady-state loop.
+2. Events must represent one particular slot generation. Re-recording a fixed event while an
+   earlier cudaStreamWaitEvent is pending can retarget that wait to later work. Use fresh,
+   timing-disabled events for each H2D completion and each retired compute slot.
+3. KMeans must enqueue norm(0) before it submits H2D(1), then enqueue assignment(0). The copy
+   stream still executes H2D(0) and H2D(1) back-to-back because H2D(0) is already in flight, while
+   norm(0) becomes eligible immediately after H2D(0). Enqueuing H2D(1) first was shown by Nsight
+   Systems to starve the reduction behind the large copy.
+4. The last batch should queue next-pass H2D(0) before its compute. After centroid finalization
+   and convergence are submitted, activate batch 0 and queue H2D(1) into the retired slot. Reset
+   must preserve both opening batches instead of copying either one twice.
+5. process_batch must receive caller-owned scalar scratch. Constructing a device scalar inside
+   every call destroys it at scope exit; the resulting cudaFree can impose a device-wide barrier.
+6. The final inertia pass must accumulate on the device and copy one scalar to pinned host memory,
+   rather than use one synchronous pageable-host scalar result per batch.
+
+Minimal implementation
+----------------------
+1. Modify cpp/src/neighbors/detail/ann_utils.cuh only where needed:
+   - replace prefetch-mode host synchronizations with generation-specific CUDA events;
+   - add an explicit prime operation and cyclic prefetch/reset behavior;
+   - keep the existing one-buffer and device-passthrough behavior unchanged;
+   - preserve writeback correctness and wait before recycling a slot;
+   - keep event destruction safe by synchronizing the copy and compute streams at iterator
+     destruction, after all waits that reference the events are complete.
+
+2. Modify cpp/src/cluster/detail/kmeans_common.cuh:
+   - pass a persistent device batch-cost scalar into process_batch;
+   - remove its per-call device allocation/destruction.
+   - keep the established distance-only arithmetic for final inertia; the prototype's fused
+     key/value path amplified float cancellation error in the zero-cost regression case.
+
+3. Modify cpp/src/cluster/detail/kmeans.cuh:
+   - use a caller-provided RAFT pool stream when available, otherwise own one non-blocking copy
+     stream for host input so minimal/Python callers cannot silently disable the pipeline;
+   - construct and prime host data and optional weight iterators on that stream;
+   - submit current-batch norm, then prefetch the next batch, then submit assignment work;
+   - cyclically prefetch batch 0 before last-batch compute, and queue batch 1 after convergence
+     is submitted so latency-critical boundary kernels stay ahead of the second transfer;
+   - recompute host-batch row norms on every pass instead of maintaining a host norm cache and
+     a second sidecar iterator. The norm reduction is mathematically identical and was about
+     6 ms versus about 150 ms for an 8 GiB H2D in the target profile, so it should be completely
+     hidden. This is the main simplification over the prototype;
+   - use persistent device scalar scratch in assignment and inertia passes;
+   - use one pinned-host copy for final inertia.
+
+4. Add focused iterator tests for:
+   - two initial H2Ds and correct alternating slots;
+   - generation-safe waits under multiple queued prefetches;
+   - cyclic batch-0 reuse after reset;
+   - writeback correctness if the common iterator API is affected.
+
+5. Keep profiling support separate from production logic. Use a small benchmark driver and retain
+   the .nsys-rep artifact, but do not carry prototype-only CUDA experiments or unrelated changes.
+
+Build-only compatibility note
+-----------------------------
+The configured cuCO dependency exports `cuco::bloom_filter_policy` rather than main's obsolete
+`cuco::default_filter_policy`. A one-token substitution in cpp/src/core/bloom_filter.cu is required
+for this checkout to build with the requested toolchain. It is unrelated to KMeans and must remain
+logically isolated from the overlap changes.
+
+
+Build and validation
+--------------------
+1. Build with:
+     ./build.sh libcuvs --gpu-arch="120-real" --cache-tool=ccache python
+2. Run the focused batch iterator tests and KMeans tests, including weighted and unweighted host
+   input and device-input regression coverage.
+3. Run a large pinned-host workload under Nsight Systems, export SQLite, and measure:
+   - H2D(0)->H2D(1) gap;
+   - norm(0) start relative to H2D(0) completion and H2D(1) duration;
+   - every later transfer transition and norm-transfer overlap;
+   - the last-batch norm/compute overlap with cyclic H2D(0);
+   - absence of cudaFree or host synchronization in the per-batch steady-state region.
+4. Compare elapsed time and inertia with the successful prototype profile and with a reference
+   run. Preserve the final .nsys-rep at a stable workspace path for Nsight Systems.
+
+Acceptance criteria
+-------------------
+- The first two bulk H2Ds are contiguous apart from normal launch latency.
+- Norm and assignment for batch 0 begin immediately after H2D(0), during H2D(1).
+- Subsequent H2Ds overlap current-batch compute, including last-batch compute versus next-pass
+  H2D(0).
+- No per-batch device allocation/free or host-wide stream synchronization remains.
+- KMeans correctness tests pass and inertia agrees with the reference within existing tolerance.
+- Production changes are limited to the iterator and KMeans implementation plus focused tests.
+  The one-token cuCO compatibility substitution documented above is the sole build-only exception.
+
+Fallback if profiling rejects norm recomputation
+------------------------------------------------
+If a tested workload exposes row norms instead of hiding them, add only the prototype's minimal
+double-buffered norm sidecar: pinned host norm cache, one norm iterator on the copy stream, and one
+event that fences cache production before the next pass. Do not add it unless the simpler pipeline
+fails an acceptance criterion.
+
+Validation outcome
+------------------
+- Requested SM120 build completed, including libcuvs and Python bindings.
+- Focused tests passed:
+    - batch iterator: 77/77;
+    - KMeans: 23/23;
+    - multi-GPU KMeans: 31/31.
+  One first-run KMeans centroid mismatch was the known nondeterministic Result/4 case already
+  reproduced on exact main; the isolated retry and complete suite retry both passed.
+- Nsight Systems workload: 40 GiB pinned host data, five 8 GiB batches, 256 features, 32 clusters,
+  three Lloyd iterations plus final inertia (20 expected bulk H2Ds total).
+- Result: 3.126 s, inertia 8.7885e+08, and 51.2 GiB/s effective over the 160 GiB minimum traffic.
+- The 20 bulk copies use stream 14 and all kernels use stream 13. Consecutive transfer gaps were
+  0.416 us median and 17.920 us maximum; there is no millisecond-scale bubble.
+- Every one of the 19 measurable row-norm-versus-next-H2D overlaps was 100%. Every first
+  substantive assignment-versus-next-H2D overlap was also 100%.
+- The three cyclic batch-4 -> next-pass batch-0 transitions were 0.416, 0.416, and 0.448 us.
+  Next-pass norm launch followed batch-0 readiness by 395.328, 218.912, and 8.448 us and overlapped
+  batch-1 H2D completely.
+- No cudaStreamSynchronize, cudaDeviceSynchronize, cudaMalloc, or cudaFree occurs per batch. The
+  only allocation/free activity in the bulk-copy window is one-time startup allocation; the
+  remaining frees and device synchronizations occur after the workload.
+- Visualizable report:
+    /raid/viclafargue/cuvs/ooc-kmeans-profile/clean-minimal/ooc_pinned.nsys-rep
