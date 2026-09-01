@@ -352,68 +352,6 @@ TEST_F(BatchLoadIteratorTest, MakeBatchLoadIteratorDevicePtr)
   }
 }
 
-TEST_F(BatchLoadIteratorTest, CyclicPrimeBeforeLastBatchWork)
-{
-  constexpr int64_t n_rows         = 257;
-  constexpr int64_t n_cols         = 17;
-  constexpr size_t batch_size_rows = 64;
-  constexpr int n_passes           = 4;
-
-  std::vector<IdxT> host_data(n_rows * n_cols);
-  for (int64_t row = 0; row < n_rows; ++row) {
-    for (int64_t col = 0; col < n_cols; ++col) {
-      host_data[row * n_cols + col] = static_cast<IdxT>(row * n_cols + col);
-    }
-  }
-
-  auto [copy_stream, enable_prefetch] = bli::get_prefetch_stream(res);
-  ASSERT_TRUE(enable_prefetch);
-  auto iter            = bli::make_batch_load_iterator<IdxT>(res,
-                                                  host_data.data(),
-                                                  n_rows,
-                                                  n_cols,
-                                                  batch_size_rows,
-                                                  copy_stream,
-                                                  raft::resource::get_workspace_resource_ref(res),
-                                                  enable_prefetch);
-  auto device_readback = raft::make_device_vector<IdxT, int64_t>(res, n_passes * n_rows * n_cols);
-
-  iter.prime();
-  for (int pass = 0; pass < n_passes; ++pass) {
-    for (auto const& batch : iter) {
-      const bool is_last = batch.offset() + batch.size() == static_cast<size_t>(n_rows);
-      if (is_last && pass + 1 < n_passes) {
-        // This is the KMeans iteration-boundary sequence: stage the next pass's first batch
-        // before enqueueing work that still reads the current pass's last batch.
-        iter.prime();
-      } else if (!is_last) {
-        iter.prefetch_next_batch();
-      }
-
-      const size_t output_offset = (static_cast<size_t>(pass) * n_rows + batch.offset()) * n_cols;
-      raft::copy(device_readback.data_handle() + output_offset,
-                 batch.data(),
-                 batch.size() * n_cols,
-                 raft::resource::get_cuda_stream(res));
-      if (is_last && pass + 1 < n_passes) { iter.prime_second_batch(); }
-    }
-  }
-
-  std::vector<IdxT> readback(n_passes * n_rows * n_cols);
-  raft::copy(readback.data(),
-             device_readback.data_handle(),
-             device_readback.size(),
-             raft::resource::get_cuda_stream(res));
-  raft::resource::sync_stream(res);
-
-  for (int pass = 0; pass < n_passes; ++pass) {
-    for (size_t i = 0; i < host_data.size(); ++i) {
-      EXPECT_EQ(readback[static_cast<size_t>(pass) * host_data.size() + i], host_data[i])
-        << "Mismatch in pass " << pass << " at element " << i;
-    }
-  }
-}
-
 static const std::array<BatchConfig, 3> kBatchConfigs = {{
   {/*initialize=*/true, /*host_writeback=*/false},
   {/*initialize=*/false, /*host_writeback=*/true},

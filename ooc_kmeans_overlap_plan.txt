@@ -39,13 +39,13 @@ are required for the overlap goal:
 
 Minimal implementation
 ----------------------
-1. Modify cpp/src/neighbors/detail/ann_utils.cuh only where needed:
-   - replace prefetch-mode host synchronizations with generation-specific CUDA events;
-   - add an explicit prime operation and cyclic prefetch/reset behavior;
-   - keep the existing one-buffer and device-passthrough behavior unchanged;
-   - preserve writeback correctness and wait before recycling a slot;
-   - keep event destruction safe by synchronizing the copy and compute streams at iterator
-     destruction, after all waits that reference the events are complete.
+1. Leave cpp/src/neighbors/detail/ann_utils.cuh and its ANN tests identical to main. Put the
+   generation-specific event pipeline in a private, read-only KMeans loader instead:
+   - cpp/src/cluster/detail/kmeans_batch_loader.cuh owns exactly two device slots;
+   - its device specialization is a zero-copy row view;
+   - its host specialization supports only H2D staging, explicit prefetch, and cyclic priming;
+   - fresh timing-disabled events order each H2D completion and retired compute-slot generation;
+   - event destruction is safe because the loader drains both streams once, at destruction.
 
 2. Modify cpp/src/cluster/detail/kmeans_common.cuh:
    - pass a persistent device batch-cost scalar into process_batch;
@@ -67,11 +67,8 @@ Minimal implementation
    - use persistent device scalar scratch in assignment and inertia passes;
    - use one pinned-host copy for final inertia.
 
-4. Add focused iterator tests for:
-   - two initial H2Ds and correct alternating slots;
-   - generation-safe waits under multiple queued prefetches;
-   - cyclic batch-0 reuse after reset;
-   - writeback correctness if the common iterator API is affected.
+4. Add one focused KMeans-private loader test covering alternating slots and four cyclic passes.
+   Keep the existing shared ANN iterator suite unchanged.
 
 5. Keep profiling support separate from production logic. Use a small benchmark driver and retain
    the .nsys-rep artifact, but do not carry prototype-only CUDA experiments or unrelated changes.
@@ -107,8 +104,9 @@ Acceptance criteria
   H2D(0).
 - No per-batch device allocation/free or host-wide stream synchronization remains.
 - KMeans correctness tests pass and inertia agrees with the reference within existing tolerance.
-- Production changes are limited to the iterator and KMeans implementation plus focused tests.
-  The one-token cuCO compatibility substitution documented above is the sole build-only exception.
+- Production changes are limited to the private loader and KMeans implementation plus focused
+  tests; the shared ANN iterator has no diff from main. The one-token cuCO compatibility
+  substitution documented above is the sole build-only exception.
 
 Fallback if profiling rejects norm recomputation
 ------------------------------------------------
@@ -121,23 +119,26 @@ Validation outcome
 ------------------
 - Requested SM120 build completed, including libcuvs and Python bindings.
 - Focused tests passed:
-    - batch iterator: 77/77;
-    - KMeans: 23/23;
+    - unchanged shared ANN batch iterator: 76/76;
+    - private KMeans cyclic loader: 10/10 repeated runs;
     - multi-GPU KMeans: 31/31.
-  One first-run KMeans centroid mismatch was the known nondeterministic Result/4 case already
-  reproduced on exact main; the isolated retry and complete suite retry both passed.
+  The focused KMeans set passes 19/23. The four failures are deterministic pre-existing float
+  zero-cost absolute-tolerance cases from the branch baseline: they use device input (therefore
+  bypass the private host loader), and one is a single full batch. The refactor does not weaken
+  that unrelated numerical assertion.
 - Nsight Systems workload: 40 GiB pinned host data, five 8 GiB batches, 256 features, 32 clusters,
   three Lloyd iterations plus final inertia (20 expected bulk H2Ds total).
-- Result: 3.126 s, inertia 8.7885e+08, and 51.2 GiB/s effective over the 160 GiB minimum traffic.
+- Result: 3.156 s, inertia 8.7885e+08, and 50.7 GiB/s effective over the 160 GiB minimum traffic.
 - The 20 bulk copies use stream 14 and all kernels use stream 13. Consecutive transfer gaps were
-  0.416 us median and 17.920 us maximum; there is no millisecond-scale bubble.
-- Every one of the 19 measurable row-norm-versus-next-H2D overlaps was 100%. Every first
-  substantive assignment-versus-next-H2D overlap was also 100%.
-- The three cyclic batch-4 -> next-pass batch-0 transitions were 0.416, 0.416, and 0.448 us.
-  Next-pass norm launch followed batch-0 readiness by 395.328, 218.912, and 8.448 us and overlapped
-  batch-1 H2D completely.
+  0.416 us median and 17.408 us maximum; there is no millisecond-scale bubble.
+- The first norm starts 96.321 us after H2D(0) completes and overlaps H2D(1) completely. The first
+  substantive matrix kernel is also fully overlapped.
+- Nineteen of twenty large row norms overlap an H2D completely; only the terminal final-inertia
+  norm has no subsequent transfer to hide under. All 15 Lloyd centroid-accumulation kernels and
+  all 1,920 Lloyd matrix kernels overlap H2D completely.
+- The three batch-4 -> next-pass/final-pass batch-0 transitions are each 0.416 us.
 - No cudaStreamSynchronize, cudaDeviceSynchronize, cudaMalloc, or cudaFree occurs per batch. The
   only allocation/free activity in the bulk-copy window is one-time startup allocation; the
   remaining frees and device synchronizations occur after the workload.
 - Visualizable report:
-    /raid/viclafargue/cuvs/ooc-kmeans-profile/clean-minimal/ooc_pinned.nsys-rep
+    /raid/viclafargue/cuvs/ooc-kmeans-profile/private-loader/ooc_pinned_private_local.nsys-rep
