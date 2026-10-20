@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -327,14 +327,24 @@ __launch_bounds__(Policy::Nthreads, 2) RAFT_KERNEL fusedL2kNN(const DataT* x,
       }
     };
 
+  const bool self_search = OpT::use_norms && x == y && lda == ldb;
+
   // epilogue operation lambda for final value calculation
   auto epilog_lambda =
-    [&distance_op, numOfNN, m, n, ldd, out_dists, out_inds, keyMax, identity] __device__(
-      AccT acc[Policy::AccRowsPerTh][Policy::AccColsPerTh],
-      OutT * regxn,
-      OutT * regyn,
-      IdxT gridStrideX,
-      IdxT gridStrideY) {
+    [&distance_op,
+     numOfNN,
+     m,
+     n,
+     ldd,
+     out_dists,
+     out_inds,
+     keyMax,
+     identity,
+     self_search] __device__(AccT acc[Policy::AccRowsPerTh][Policy::AccColsPerTh],
+                             OutT * regxn,
+                             OutT * regyn,
+                             IdxT gridStrideX,
+                             IdxT gridStrideY) {
       // Use ::template to disambiguate (See:
       // https://en.cppreference.com/w/cpp/language/dependent_name)
       int smem_offset = OpT::template shared_mem_size<Policy>();
@@ -344,6 +354,20 @@ __launch_bounds__(Policy::Nthreads, 2) RAFT_KERNEL fusedL2kNN(const DataT* x,
       const IdxT starty       = gridStrideY + (threadIdx.x / Policy::AccThCols);
       const IdxT startx       = gridStrideX + (threadIdx.x % Policy::AccThCols);
       const int lid           = raft::laneId();
+
+      // Expanded L2 can leave positive round-off for a row compared with itself.
+      // Correct known self-distances before they participate in top-k selection.
+      if (self_search) {
+#pragma unroll
+        for (int i = 0; i < Policy::AccRowsPerTh; ++i) {
+          const auto row = starty + i * Policy::AccThRows;
+#pragma unroll
+          for (int j = 0; j < Policy::AccColsPerTh; ++j) {
+            const auto col = startx + j * Policy::AccThCols;
+            if (row == col) { acc[i][j] = AccT{0}; }
+          }
+        }
+      }
 
       myWarpSelect heapArr1(identity, keyMax, numOfNN);
       myWarpSelect heapArr2(identity, keyMax, numOfNN);

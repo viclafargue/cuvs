@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "../../src/neighbors/detail/knn_brute_force.cuh"
 #include "../test_utils.cuh"
 #include "./knn_utils.cuh"
 #include <cuvs/distance/distance.hpp>
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <vector>
 
 namespace cuvs::neighbors::brute_force {
@@ -272,6 +274,100 @@ TEST(BruteForceEqualNorms, PreservesNeighborOrdering)
     }
   }
 }
+
+template <typename T>
+void test_exact_self_distances(bool tiled)
+{
+  raft::resources handle;
+  auto stream              = raft::resource::get_cuda_stream(handle);
+  const int64_t n_database = tiled ? 257 : 800;
+  const int64_t n_queries  = tiled ? n_database - 13 : n_database;
+  // A nonidentity epilogue checks that tiled search corrects distances before applying it.
+  const float self_distance = tiled ? 1.0f : 0.0f;
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> distribution(-10.0f, 10.0f);
+
+  for (int64_t dim : {int64_t{8}, int64_t{32}}) {
+    // Fractional coordinates expose differences between norm and dot-product accumulation.
+    std::vector<T> h_database(n_database * dim);
+    for (auto& value : h_database) {
+      value = static_cast<T>(distribution(rng));
+    }
+    auto database = raft::make_device_matrix<T, int64_t>(handle, n_database, dim);
+    raft::update_device(database.data_handle(), h_database.data(), h_database.size(), stream);
+    auto queries =
+      raft::make_device_matrix_view<const T, int64_t>(database.data_handle(), n_queries, dim);
+
+    for (auto metric :
+         {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::L2SqrtExpanded}) {
+      index_params params;
+      params.metric = metric;
+      auto index    = build(handle, params, raft::make_const_mdspan(database.view()));
+
+      // Small k uses the fused kernel; k > 64 uses tiled pairwise distances.
+      for (int64_t k : {int64_t{8}, int64_t{65}}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "dim=" << dim << " metric=" << static_cast<int>(metric) << " k=" << k);
+        auto neighbors = raft::make_device_matrix<int64_t, int64_t>(handle, n_queries, k);
+        auto distances = raft::make_device_matrix<float, int64_t>(handle, n_queries, k);
+        if (tiled) {
+          auto epilogue = [=] __device__(float distance, int64_t, int64_t) {
+            return distance + self_distance;
+          };
+          // Unequal tile sizes make the self-diagonal cross tile boundaries.
+          cuvs::neighbors::detail::tiled_brute_force_knn<T, int64_t, float, decltype(epilogue)>(
+            handle,
+            queries.data_handle(),
+            database.data_handle(),
+            n_queries,
+            n_database,
+            dim,
+            k,
+            distances.data_handle(),
+            neighbors.data_handle(),
+            metric,
+            2.0f,
+            31,
+            73,
+            nullptr,
+            nullptr,
+            nullptr,
+            epilogue);
+        } else {
+          search(handle,
+                 search_params{},
+                 index,
+                 queries,
+                 neighbors.view(),
+                 distances.view(),
+                 filtering::none_sample_filter{});
+        }
+
+        std::vector<int64_t> h_neighbors(n_queries * k);
+        std::vector<float> h_distances(n_queries * k);
+        raft::update_host(h_neighbors.data(), neighbors.data_handle(), h_neighbors.size(), stream);
+        raft::update_host(h_distances.data(), distances.data_handle(), h_distances.size(), stream);
+        raft::resource::sync_stream(handle, stream);
+
+        for (int64_t i = 0; i < n_queries; ++i) {
+          EXPECT_EQ(h_neighbors[i * k], i) << "query=" << i;
+          EXPECT_EQ(h_distances[i * k], self_distance) << "query=" << i;
+          for (int64_t j = 1; j < k; ++j) {
+            EXPECT_GT(h_distances[i * k + j], self_distance) << "query=" << i << " rank=" << j;
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(BruteForceSelfDistance, ExactSelfDistancesFloat) { test_exact_self_distances<float>(false); }
+TEST(BruteForceSelfDistance, ExactSelfDistancesHalf) { test_exact_self_distances<half>(false); }
+TEST(BruteForceSelfDistance, ExactSelfDistancesTiledFloat)
+{
+  test_exact_self_distances<float>(true);
+}
+TEST(BruteForceSelfDistance, ExactSelfDistancesTiledHalf) { test_exact_self_distances<half>(true); }
 
 // Also test with larger random inputs, including col-major inputs
 struct RandomKNNInputs {

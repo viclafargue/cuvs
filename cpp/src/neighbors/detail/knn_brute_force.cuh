@@ -203,6 +203,7 @@ void tiled_brute_force_knn(const raft::resources& handle,
         auto col_norms = precomputed_index_norms ? precomputed_index_norms : index_norms.data();
         auto dist      = temp_distances.data();
         bool sqrt      = metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+        bool self_search = search == index;
 
         raft::linalg::map_offset(
           handle,
@@ -212,7 +213,9 @@ void tiled_brute_force_knn(const raft::resources& handle,
             IndexType col = j + (idx % current_centroid_size);
 
             cuvs::distance::detail::ops::l2_exp_cutlass_op<DistanceT, DistanceT> l2_op(sqrt);
-            auto val = l2_op(row_norms[row], col_norms[col], dist[idx]);
+            // Use global row/column indices: the diagonal can cross tile boundaries.
+            auto val = self_search && row == col ? DistanceT{0}
+                                                 : l2_op(row_norms[row], col_norms[col], dist[idx]);
             return distance_epilogue(val, row, col);
           });
       } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
